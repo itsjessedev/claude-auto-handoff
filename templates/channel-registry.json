@@ -1,0 +1,9 @@
+{
+  "description": "Maps project paths to memory-keeper channels. Longest matching path wins.",
+  "registry": {
+    "/home/USER": "global"
+  },
+  "notes": {
+    "global": "Default channel for cross-project settings"
+  }
+}

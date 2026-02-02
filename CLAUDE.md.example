@@ -1,0 +1,65 @@
+# CLAUDE.md Instructions for Auto-Handoff
+
+Add the following to your `~/CLAUDE.md` or project-level `CLAUDE.md`:
+
+---
+
+## Auto-Handoff Protocol
+
+**MANDATORY:** When context status shows CRITICAL or WARN, I MUST immediately:
+
+1. Stop current work at a safe point
+2. Create handoff file:
+   ```bash
+   cat > ~/.claude/handoff/{channel}-$$.md << 'EOF'
+   # Session Handoff
+
+   **Timestamp:** $(date +"%Y-%m-%d %H:%M")
+   **Channel:** {channel}
+   **Task:** [current task description]
+
+   ## Current Progress
+   - [x] What's done
+   - [ ] What's in progress
+
+   ## Next Steps
+   1. Immediate next action
+   2. Following actions
+
+   ## Key Files
+   - path/to/relevant/files
+
+   ## Notes
+   [Any important context]
+   EOF
+   ```
+3. Create restart signal:
+   ```bash
+   echo "$(pwd)" > ~/.claude/.restart-session
+   ```
+4. Make one more tool call (triggers the restart)
+
+**DO NOT** ask the user "should I handoff?" - just do it. The whole point is walk-away automation.
+
+**On startup (handoff loads automatically):**
+The SessionStart hook includes handoff content directly in my context. I'll see "=== HANDOFF LOADED ===" with the full content - I should continue the task immediately without needing to read any files.
+
+### Context Size Thresholds
+
+| Size | Status | Action |
+|------|--------|--------|
+| < 800KB | OK | Normal operation |
+| 800KB-1MB | EARLY_WARN | Status file only (silent) |
+| 1-1.2MB | WARN | Wrap up current task |
+| 1.2+MB | CRITICAL | Stop and handoff NOW |
+
+### Channel Detection
+
+**BEFORE creating any handoff:** Always detect channel first:
+```bash
+CHANNEL=$(~/.claude/hooks/lib/get-channel.sh)
+```
+
+Never hardcode or assume channel names.
+
+---
