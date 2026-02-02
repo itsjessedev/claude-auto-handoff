@@ -39,7 +39,8 @@ get_current_transcript_path() {
 generate_handoff_id() {
     local session_id="${1:-$(get_current_session_id)}"
     local timestamp=$(date +%Y%m%d-%H%M%S)
-    local prefix="${session_id:0:8}"
+    # Take first 8 chars and remove non-alphanumeric to keep ID format clean
+    local prefix=$(echo "${session_id:0:8}" | tr -cd 'a-zA-Z0-9')
     [ -z "$prefix" ] && prefix="nosess"
     echo "HO-${timestamp}-${prefix}"
 }
