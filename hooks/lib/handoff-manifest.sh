@@ -82,7 +82,7 @@ create_handoff() {
 
     # Archive existing handoff if present
     if [ -f "$handoff_file" ]; then
-        local old_id=$(head -5 "$handoff_file" 2>/dev/null | grep -o 'HO-[0-9-]*-[a-f0-9]*')
+        local old_id=$(head -5 "$handoff_file" 2>/dev/null | grep -oE 'HO-[0-9]{8}-[0-9]{6}-[a-zA-Z0-9]+')
         if [ -n "$old_id" ]; then
             mv "$handoff_file" "$HANDOFF_ARCHIVE_DIR/${old_id}.md" 2>/dev/null
         else
@@ -141,7 +141,8 @@ load_handoff() {
     [ ! -f "$handoff_file" ] && return 1
 
     # Verify ID matches between file and manifest
-    local file_id=$(head -5 "$handoff_file" 2>/dev/null | grep -o 'HO-[0-9-]*-[a-f0-9]*')
+    # ID format: HO-YYYYMMDD-HHMMSS-prefix (prefix is alphanumeric)
+    local file_id=$(head -5 "$handoff_file" 2>/dev/null | grep -oE 'HO-[0-9]{8}-[0-9]{6}-[a-zA-Z0-9]+')
     local manifest_id=$(echo "$manifest" | jq -r '.current.id')
 
     if [ "$file_id" != "$manifest_id" ]; then

@@ -198,7 +198,7 @@ if [ $LOAD_RESULT -eq 0 ] && [ -n "$HANDOFF_CONTENT" ]; then
     # Successfully loaded handoff from manifest
 
     # Get handoff metadata from the content header
-    HANDOFF_ID=$(echo "$HANDOFF_CONTENT" | head -10 | grep -o 'HANDOFF-ID: [^-]*-[^-]*-[^-]*-[a-f0-9]*' | cut -d' ' -f2)
+    HANDOFF_ID=$(echo "$HANDOFF_CONTENT" | head -10 | grep -oE 'HANDOFF-ID: HO-[0-9]{8}-[0-9]{6}-[a-zA-Z0-9]+' | cut -d' ' -f2)
     PREV_SESSION=$(echo "$HANDOFF_CONTENT" | head -10 | grep -o 'SESSION: [^ ]*' | cut -d' ' -f2 | tr -d '>' )
     HANDOFF_TYPE=$(echo "$HANDOFF_CONTENT" | head -10 | grep -o 'TYPE: [a-z]*' | cut -d' ' -f2)
 
