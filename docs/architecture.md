@@ -2,25 +2,32 @@
 
 ## System Overview
 
-The auto-handoff system consists of four main components working together:
+The auto-handoff system consists of five main components working together:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              WRAPPER SCRIPT                                  │
-│                         bin/claude-wrapper                                   │
+│                           claude-wrapper                                     │
 │                                                                              │
 │  ┌─────────────────────┐       ┌─────────────────────────────────────────┐  │
-│  │  Background Monitor │       │  Main Loop                               │  │
+│  │  Session Tracker    │       │  Main Loop                               │  │
 │  │  (subshell)         │       │                                          │  │
 │  │                     │       │  while true; do                          │  │
-│  │  Every 0.5s:        │       │    clean signal files                    │  │
-│  │  - Check for        │       │    set .load-handoff flag if needed      │  │
-│  │    restart signal   │───────│    start_monitor()                       │  │
-│  │  - If found: kill   │       │    run Claude                            │  │
-│  │    Claude process   │       │    if killed by monitor → continue       │  │
-│  │                     │       │    else → break                          │  │
-│  └─────────────────────┘       └─────────────────────────────────────────┘  │
-│                                                                              │
+│  │  Watches for new    │       │    clean signal files                    │  │
+│  │  transcript, writes │───────│    track_session()                       │  │
+│  │  ID:path to         │       │    start_monitor()                       │  │
+│  │  .current-session   │       │    run Claude                            │  │
+│  └─────────────────────┘       │    if killed by monitor → continue       │  │
+│                                │    else → break                          │  │
+│  ┌─────────────────────┐       └─────────────────────────────────────────┘  │
+│  │  Background Monitor │                                                     │
+│  │  (subshell)         │                                                     │
+│  │                     │                                                     │
+│  │  Every 0.25s:       │                                                     │
+│  │  - Check for signal │                                                     │
+│  │  - Verify session   │                                                     │
+│  │  - If match: kill   │                                                     │
+│  └─────────────────────┘                                                     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                         │
                                         ▼
@@ -31,20 +38,21 @@ The auto-handoff system consists of four main components working together:
 │  │  PostToolUse Hook: context-monitor.sh                                  │  │
 │  │                                                                        │  │
 │  │  After EVERY tool call:                                                │  │
-│  │  1. Find current transcript: ~/.claude/projects/*/*.jsonl              │  │
+│  │  1. Read ~/.claude/.current-session for transcript path                │  │
 │  │  2. Get file size                                                      │  │
 │  │  3. Compare against thresholds                                         │  │
 │  │  4. Write STATUS:SIZE to ~/.claude/.context-status                     │  │
+│  │  5. If CRITICAL: call pre-compact-handoff.sh + create restart signal   │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                        │                                     │
 │                                        ▼                                     │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Claude's Behavior (per CLAUDE.md instructions)                        │  │
+│  │  Pre-Compact Hook: pre-compact-handoff.sh                              │  │
 │  │                                                                        │  │
-│  │  When status shows CRITICAL:                                           │  │
-│  │  1. Save state to handoff file: ~/.claude/handoff/{channel}-{pid}.md   │  │
-│  │  2. Create restart signal: ~/.claude/.restart-session                  │  │
-│  │  3. Make one more tool call (triggers monitor detection)               │  │
+│  │  1. Get channel from get-channel.sh                                    │  │
+│  │  2. Extract recent context from transcript                             │  │
+│  │  3. Call create_handoff() from manifest library                        │  │
+│  │  4. Manifest updated with unique handoff ID                            │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -56,20 +64,20 @@ The auto-handoff system consists of four main components working together:
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
 │  │  SessionStart Hook: session-start-from-handoff.sh                      │  │
 │  │                                                                        │  │
-│  │  1. Check for .load-handoff flag (set by wrapper)                      │  │
-│  │  2. Acquire atomic lock (mkdir-based)                                  │  │
-│  │  3. Find valid handoff file (< 2 hours, dead PID)                      │  │
+│  │  1. Acquire atomic lock (mkdir-based)                                  │  │
+│  │  2. Call load_handoff() from manifest library                          │  │
+│  │  3. Manifest verifies: status=active, age<2hr, ID matches file         │  │
 │  │  4. JSON-escape content                                                │  │
 │  │  5. Include in additionalContext (Claude sees immediately)             │  │
-│  │  6. Delete handoff file                                                │  │
+│  │  6. Archive handoff file, update manifest to consumed                  │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 │  Claude sees:                                                                │
-│  === HANDOFF LOADED ===                                                      │
-│  Channel: myproject                                                          │
-│  Handoff ID: myproject-12345                                                 │
-│  Previous PID: 12345                                                         │
-│  [full handoff content]                                                      │
+│  === HANDOFF LOADED (ID: HO-20260202-064530-c74cc080) ===                    │
+│  Channel: global                                                             │
+│  Previous Session: c74cc080-94b9-4841-b82f-a62cfb8efdc0                      │
+│  Type: auto                                                                  │
+│  [full handoff content with metadata header]                                 │
 │  === END HANDOFF ===                                                         │
 │                                                                              │
 │  → Instant resume, zero tool calls needed                                    │
@@ -79,29 +87,71 @@ The auto-handoff system consists of four main components working together:
 
 ## Key Design Decisions
 
-### 1. Kill/Restart vs Survive Compaction
+### 1. Manifest-Based Handoff System
+
+**Decision:** Use a JSON manifest file as single source of truth instead of glob-based file search.
+
+**Rationale:** The original system used PID-based filenames (`{channel}-{pid}.md`) and glob searches to find handoffs. This caused problems:
+- Multiple handoff files could exist for the same channel
+- Unclear which one to load
+- Race conditions between creation and consumption
+- No way to track handoff state (active, consumed, expired)
+
+The manifest system provides:
+- Single active handoff per channel, always
+- Unique ID linking handoff to source session
+- Status tracking (active → consumed/expired)
+- Verification (ID in file must match manifest)
+- Audit trail (consumed_by_pid, consumed_at)
+
+### 2. Session Tracking via .current-session
+
+**Decision:** Wrapper writes session ID:transcript_path to a file, hooks read from it.
+
+**Rationale:** The original system used `find` to locate the active transcript. This was:
+- Slow (especially with many sessions)
+- Could miss the active session
+- Couldn't distinguish between parallel sessions
+
+Direct file lookup is:
+- Instant (~100x faster)
+- Never misses
+- Tied to specific wrapper instance
+
+### 3. Session ID Verification Before Kill
+
+**Decision:** Monitor verifies session ID in restart signal matches tracked session.
+
+**Rationale:** Without verification, a stale restart signal from a previous session could kill the wrong Claude instance. The new flow:
+1. context-monitor writes `SESSION_ID:WORKING_DIR` to restart signal
+2. Monitor reads signal, compares SESSION_ID to tracked session
+3. Only kills if IDs match
+4. Mismatches are logged and ignored
+
+### 4. Kill/Restart vs Survive Compaction
 
 **Decision:** Kill the process and restart fresh.
 
 **Rationale:** Auto-compaction is lossy by design - it summarizes the conversation, losing detail. A fresh session with explicit, user-defined state is better than a summarized one where you don't control what's kept.
 
-### 2. Wrapper Script vs Hook-Only
+### 5. Wrapper Script vs Hook-Only
 
 **Decision:** Use a wrapper script around Claude.
 
 **Rationale:** Hooks cannot control the parent process lifecycle. They can save state, but they can't kill and restart Claude. The wrapper provides the control plane:
-- Spawns a background monitor subprocess
+- Spawns session tracker subprocess
+- Spawns background monitor subprocess
 - Detects when monitor kills Claude (vs user Ctrl+C)
 - Restarts with continuation prompt
-- Manages the load-handoff flag
+- Cleans up on exit
 
-### 3. Inline Content vs File Read
+### 6. Inline Content vs File Read
 
 **Decision:** Include handoff content directly in hook's `additionalContext` output.
 
 **Rationale:** Earlier versions told Claude to "read the handoff file" on startup. This required a tool call, which took time and could fail. By including content inline, Claude sees the handoff in its first system message - no searching, no reading, instant context.
 
-### 4. Atomic Directory Locks
+### 7. Atomic Directory Locks
 
 **Decision:** Use `mkdir` for lock acquisition instead of file-based locks.
 
@@ -120,7 +170,7 @@ if mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 ```
 
-### 5. Channel System
+### 8. Channel System
 
 **Decision:** Organize handoffs by "channel" (project) rather than globally.
 
@@ -130,60 +180,105 @@ fi
 - Integrates with memory-keeper MCP's channel concept
 - Longest-path-match allows nested project hierarchies
 
-### 6. PID in Handoff Filenames
+### 9. Handoff ID Format
 
-**Decision:** Include the creating session's PID in handoff filenames: `{channel}-{pid}.md`
+**Decision:** Use `HO-{YYYYMMDD}-{HHMMSS}-{session_prefix}` format.
 
 **Rationale:**
-- Prevents one session from loading another active session's handoff
-- Hook checks if PID is alive before loading
-- Dead PID = safe to load; alive PID = another session owns it
-
-### 7. 2-Hour Expiry
-
-**Decision:** Ignore handoffs older than 2 hours.
-
-**Rationale:** Stale handoffs cause confusion. If you come back to a project after a day, you probably don't want to continue mid-task from yesterday. Fresh start is cleaner.
+- `HO-` prefix makes handoffs identifiable
+- Timestamp ensures uniqueness
+- Session prefix (first 8 chars of UUID) links to source session
+- Human-readable in logs and messages
 
 ## File Formats
 
+### Manifest File
+
+Location: `~/.claude/handoff/{channel}.manifest.json`
+
+```json
+{
+  "channel": "global",
+  "current": {
+    "id": "HO-20260202-064530-c74cc080",
+    "session_id": "c74cc080-94b9-4841-b82f-a62cfb8efdc0",
+    "created_at": "2026-02-02T06:45:30Z",
+    "created_by_pid": 12345,
+    "working_dir": "/home/jesse",
+    "type": "auto",
+    "status": "active"
+  }
+}
+```
+
+Status values:
+- `active` - Ready to be loaded
+- `consumed` - Loaded by a session
+- `expired` - Older than 2 hours
+- `cleared` - Manually cleared
+
 ### Handoff File
 
+Location: `~/.claude/handoff/{channel}-CURRENT.md`
+
 ```markdown
-# Session Handoff
+<!-- HANDOFF-ID: HO-20260202-064530-c74cc080 -->
+<!-- SESSION: c74cc080-94b9-4841-b82f-a62cfb8efdc0 -->
+<!-- CHANNEL: global -->
+<!-- CREATED: 2026-02-02T06:45:30Z -->
+<!-- TYPE: auto -->
+<!-- WORKING-DIR: /home/jesse -->
 
-**Timestamp:** 2026-02-02 03:30
-**Channel:** myproject
-**Task:** Implementing authentication
+# Auto-Handoff (Pre-Compaction)
 
-## Current Progress
-- [x] Database schema
-- [x] User model
-- [ ] JWT middleware
+**Timestamp:** 2026-02-02 06:45
+**Project:** /home/jesse
+**Channel:** global
+**Session:** c74cc080-94b9-4841-b82f-a62cfb8efdc0
 
-## Next Steps
-1. Finish JWT middleware
-2. Add route protection
+## Recent Activity
 
-## Key Files
-- src/models/user.ts
-- src/middleware/auth.ts
 ```
+user: Continue with the implementation...
+assistant: Working on the authentication module...
+```
+
+## Instructions for Claude
+
+1. Call `context_get({ channel: 'global', priorities: ['high'] })`
+2. Announce: "Restored from auto-handoff. Channel: global"
+3. Continue where we left off
+```
+
+### Session Tracking File
+
+Location: `~/.claude/.current-session`
+
+```
+c74cc080-94b9-4841-b82f-a62cfb8efdc0:/home/jesse/.claude/projects/-home-jesse/c74cc080-94b9-4841-b82f-a62cfb8efdc0.jsonl
+```
+
+Format: `{session_uuid}:{transcript_path}`
 
 ### Context Status File
 
+Location: `~/.claude/.context-status`
+
 ```
-CRITICAL:1.2MB
+CRITICAL:1.7MB
 ```
 
 Format: `STATUS:SIZE` where STATUS is one of: OK, EARLY_WARN, WARN, CRITICAL
 
 ### Restart Signal File
 
-Contains the working directory path:
+Location: `~/.claude/.restart-session`
+
 ```
-/home/user/myproject
+c74cc080-94b9-4841-b82f-a62cfb8efdc0:/home/jesse
 ```
+
+Format: `{session_uuid}:{working_directory}`
 
 ### Lock Directory
 
@@ -196,25 +291,27 @@ Contains the working directory path:
 
 ```bash
 # Default thresholds (adjust for your system)
-EARLY_WARN_KB=800   # ~800KB - status file only
-WARN_KB=1024        # ~1MB - Claude should wrap up
-CRITICAL_KB=1200    # ~1.2MB - handoff NOW
+EARLY_WARN_KB=1300  # ~1.3MB - status file only
+WARN_KB=1500        # ~1.5MB - wrap up current task
+CRITICAL_KB=1700    # ~1.7MB - auto-handoff triggered
 ```
 
-These are based on observed auto-compact trigger at ~1.4MB. Leave margin for Claude to complete the handoff process.
+Based on observed context limit at ~2MB with auto-compact disabled. Leave margin for handoff creation.
 
 ## Error Handling
 
 ### Race Conditions
 
-- **Lock acquisition:** Atomic mkdir with retry
+- **Lock acquisition:** Atomic mkdir with stale lock cleanup
 - **File disappears mid-read:** Graceful fallback to fresh start
-- **Multiple handoffs for same channel:** Select newest by mtime
+- **Manifest/file ID mismatch:** Error logged, handoff rejected
+- **Session ID mismatch:** Restart signal ignored, logged
 
 ### Fallbacks
 
+- **Session file missing:** Falls back to `find` for transcript
 - **Python not available:** Fallback to sed-based JSON escaping
-- **jq not available:** Manual settings.json merge required
+- **jq not available:** Basic manifest operations may fail (jq required)
 - **Hooks fail silently:** Claude continues, just without monitoring
 
 ### Safety Limits
@@ -222,3 +319,24 @@ These are based on observed auto-compact trigger at ~1.4MB. Leave margin for Cla
 - **Max 10 restarts:** Prevents infinite loops
 - **2-hour handoff expiry:** Prevents stale state
 - **Exit code 130 handling:** User Ctrl+C never triggers restart
+
+## Shared Library
+
+`hooks/lib/handoff-manifest.sh` provides:
+
+| Function | Purpose |
+|----------|---------|
+| `get_current_session_id()` | Read session ID from .current-session |
+| `get_current_transcript_path()` | Read transcript path from .current-session |
+| `generate_handoff_id()` | Create unique HO-{timestamp}-{session} ID |
+| `read_manifest()` | Read channel's manifest JSON |
+| `write_manifest()` | Atomic write to manifest |
+| `create_handoff()` | Create handoff file + update manifest |
+| `load_handoff()` | Load and consume handoff |
+| `get_active_handoff_file()` | Get path to active handoff |
+| `get_active_handoff_id()` | Get ID of active handoff |
+| `has_active_handoff()` | Check if active handoff exists |
+| `clear_handoff()` | Clear without consuming |
+| `extract_recent_context()` | Extract last N messages from transcript |
+| `write_session_file()` | Write .current-session (for wrapper) |
+| `clear_session_file()` | Remove .current-session |

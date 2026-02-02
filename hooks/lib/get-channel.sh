@@ -7,8 +7,35 @@
 #   CHANNEL=$(get_channel "/some/specific/path")
 
 get_channel() {
-    local cwd="${1:-$(pwd)}"
     local registry="$HOME/.claude/channel-registry.json"
+    local cwd
+
+    # Priority: 1) explicit argument, 2) session origin file, 3) current pwd
+    # Session origin prevents pwd drift from breaking channel detection
+
+    if [[ -n "$1" ]]; then
+        cwd="$1"  # Explicit path argument takes priority
+    else
+        # Find session origin file (PID-specific for parallel session isolation)
+        # Try current shell's ancestors to find the Claude session's origin
+        local origin_file=""
+        local check_pid=$$
+        for _ in 1 2 3 4 5; do  # Check up to 5 ancestors
+            if [[ -f "$HOME/.claude/.session-origin-$check_pid" ]]; then
+                origin_file="$HOME/.claude/.session-origin-$check_pid"
+                break
+            fi
+            # Move to parent
+            check_pid=$(ps -o ppid= -p "$check_pid" 2>/dev/null | tr -d ' ')
+            [[ -z "$check_pid" || "$check_pid" == "1" ]] && break
+        done
+
+        if [[ -n "$origin_file" && -f "$origin_file" ]]; then
+            cwd=$(cat "$origin_file")
+        else
+            cwd="$(pwd)"  # Fallback to current directory
+        fi
+    fi
 
     # Default fallback
     if [[ ! -f "$registry" ]]; then

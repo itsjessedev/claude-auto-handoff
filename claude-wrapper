@@ -1,0 +1,298 @@
+#!/bin/bash
+# Claude Auto-Session Wrapper
+#
+# Features:
+# - Session tracking (writes session ID + transcript path to .current-session)
+# - Manifest-based handoff detection
+# - Session ID verification before killing
+# - Auto-restart on context limit
+
+LOG_FILE="$HOME/.claude/auto-session.log"
+RESTART_FILE="$HOME/.claude/.restart-session"
+HANDOFF_DIR="$HOME/.claude/handoff"
+WRAPPER_PID_FILE="$HOME/.claude/.wrapper-pid"
+KILLED_BY_MONITOR="$HOME/.claude/.killed-by-monitor"
+CURRENT_SESSION_FILE="$HOME/.claude/.current-session"
+SESSION_DIR="$HOME/.claude/projects"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+find_claude() {
+    for c in "$HOME/.local/bin/claude" "/usr/local/bin/claude" "/usr/bin/claude"; do
+        [ -x "$c" ] && [ ! "$c" -ef "$0" ] && echo "$c" && return
+    done
+    command -v claude
+}
+
+CLAUDE_BIN=$(find_claude)
+[ -z "$CLAUDE_BIN" ] && echo "ERROR: Cannot find claude" && exit 1
+
+CLAUDE_DEFAULT_FLAGS="--dangerously-skip-permissions"
+
+# Load shared libraries
+source "$HOME/.claude/hooks/lib/get-channel.sh" 2>/dev/null || true
+source "$HOME/.claude/hooks/lib/handoff-manifest.sh" 2>/dev/null || true
+
+get_current_channel() {
+    type get_channel &>/dev/null && get_channel "$1" || echo "global"
+}
+
+# Store our PID
+echo $$ > "$WRAPPER_PID_FILE"
+
+# Monitor PID will be set per-iteration
+MONITOR_PID=""
+CURRENT_SESSION_UUID=""
+
+cleanup() {
+    rm -f "$WRAPPER_PID_FILE"
+    rm -f "$CURRENT_SESSION_FILE"
+    [ -n "$MONITOR_PID" ] && kill $MONITOR_PID 2>/dev/null
+}
+trap cleanup EXIT
+
+# Function to track active session
+# Waits for Claude to create a transcript, then writes session info
+track_session() {
+    local wrapper_pid=$$
+    (
+        # Wait up to 10 seconds for a new transcript file
+        for i in {1..40}; do
+            sleep 0.25
+
+            # Safety: Exit if wrapper is gone
+            if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+                exit 0
+            fi
+
+            # Find newest transcript modified in last 30 seconds
+            NEWEST=$(find "$SESSION_DIR" -maxdepth 2 -name "*.jsonl" -mmin -0.5 -type f 2>/dev/null | \
+                grep -v "/subagents/" | \
+                xargs -r ls -t 2>/dev/null | \
+                head -1)
+
+            if [ -n "$NEWEST" ] && [ -f "$NEWEST" ]; then
+                SESSION_UUID=$(basename "$NEWEST" .jsonl)
+                echo "${SESSION_UUID}:${NEWEST}" > "$CURRENT_SESSION_FILE"
+                log "Tracking session: $SESSION_UUID"
+                exit 0
+            fi
+        done
+        log "Warning: Could not find transcript to track"
+    ) &
+}
+
+# Function to start monitor subprocess
+start_monitor() {
+    local MY_WRAPPER_PID=$$  # Capture THIS wrapper's PID
+
+    # Kill any existing monitor
+    [ -n "$MONITOR_PID" ] && kill $MONITOR_PID 2>/dev/null
+
+    (
+        while true; do
+            sleep 0.25
+
+            # Safety: Exit if our wrapper is dead (prevents stale monitors)
+            if ! kill -0 "$MY_WRAPPER_PID" 2>/dev/null; then
+                exit 0
+            fi
+
+            [ ! -f "$WRAPPER_PID_FILE" ] && exit 0
+
+            # Safety: Only act if WE are still the current wrapper
+            CURRENT_WRAPPER=$(cat "$WRAPPER_PID_FILE" 2>/dev/null)
+            if [ "$CURRENT_WRAPPER" != "$MY_WRAPPER_PID" ]; then
+                # Another wrapper took over - we're stale, exit silently
+                exit 0
+            fi
+
+            if [ -f "$RESTART_FILE" ]; then
+                # Read restart signal (format: SESSION_ID:WORKING_DIR)
+                SIGNAL_CONTENT=$(cat "$RESTART_FILE" 2>/dev/null)
+                SIGNAL_SESSION=$(echo "$SIGNAL_CONTENT" | cut -d: -f1)
+                SIGNAL_DIR=$(echo "$SIGNAL_CONTENT" | cut -d: -f2-)
+
+                # Verify session ID if we have one tracked
+                if [ -f "$CURRENT_SESSION_FILE" ]; then
+                    TRACKED_SESSION=$(cut -d: -f1 "$CURRENT_SESSION_FILE" 2>/dev/null)
+                    if [ -n "$SIGNAL_SESSION" ] && [ -n "$TRACKED_SESSION" ] && [ "$SIGNAL_SESSION" != "$TRACKED_SESSION" ]; then
+                        log "Monitor: Session mismatch - signal:$SIGNAL_SESSION tracked:$TRACKED_SESSION - ignoring"
+                        rm -f "$RESTART_FILE"
+                        continue
+                    fi
+                fi
+
+                MY_PID=$BASHPID
+                # Find Claude (child of wrapper that isn't this monitor subprocess)
+                CLAUDE_PID=$(pgrep -P "$MY_WRAPPER_PID" 2>/dev/null | grep -v "^${MY_PID}$" | head -1)
+                if [ -n "$CLAUDE_PID" ]; then
+                    log "Monitor: Killing Claude PID $CLAUDE_PID (session: $SIGNAL_SESSION)"
+                    # Mark that WE killed it (not user Ctrl+C)
+                    touch "$KILLED_BY_MONITOR"
+                    # Store the working dir for restart
+                    [ -n "$SIGNAL_DIR" ] && echo "$SIGNAL_DIR" > "$RESTART_FILE.dir"
+                    # Fast kill - TERM should work, quick KILL fallback
+                    kill -TERM "$CLAUDE_PID" 2>/dev/null
+                    sleep 0.2
+                    kill -9 "$CLAUDE_PID" 2>/dev/null
+                fi
+                exit 0
+            fi
+        done
+    ) &
+    MONITOR_PID=$!
+}
+
+# Check for flags
+USER_WANTS_RESUME=false
+USER_WANTS_HANDOFF=false
+FILTERED_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        -r|-c|--resume|--continue) USER_WANTS_RESUME=true; FILTERED_ARGS+=("$arg") ;;
+        -h|--handoff) USER_WANTS_HANDOFF=true ;;  # Don't pass to claude
+        *) FILTERED_ARGS+=("$arg") ;;
+    esac
+done
+
+RESTART_COUNT=0
+MAX_RESTARTS=10
+WORKING_DIR="${PWD}"
+
+log "=== Wrapper $$ started in $WORKING_DIR ==="
+
+while true; do
+    # Clean up signals and trigger locks from previous iterations
+    rm -f "$RESTART_FILE" "$RESTART_FILE.dir" "$KILLED_BY_MONITOR"
+    rm -f "$HOME/.claude/.critical-triggered-"* 2>/dev/null
+    rm -f "$CURRENT_SESSION_FILE"
+
+    CHANNEL=$(get_current_channel "$WORKING_DIR")
+    log "Channel: $CHANNEL, Restart #$RESTART_COUNT"
+
+    # Start fresh monitor for this Claude instance
+    start_monitor
+    log "Monitor PID: $MONITOR_PID"
+
+    # Start session tracker (background - will write session file when transcript appears)
+    track_session
+
+    # Run Claude
+    if [ $RESTART_COUNT -eq 0 ]; then
+        # First start - check if user explicitly wants handoff
+        if [ "$USER_WANTS_HANDOFF" = true ]; then
+            # Check for active handoff using manifest system
+            if type has_active_handoff &>/dev/null && has_active_handoff "$CHANNEL"; then
+                HANDOFF_FILE=$(get_active_handoff_file "$CHANNEL")
+                HANDOFF_ID=$(get_active_handoff_id "$CHANNEL")
+                log "User requested handoff, found: $HANDOFF_ID - loading"
+                $CLAUDE_BIN $CLAUDE_DEFAULT_FLAGS "Continue from handoff. The handoff should be auto-loaded by the session hook. If not, read $HANDOFF_FILE"
+            else
+                log "User requested handoff but none found - starting fresh"
+                $CLAUDE_BIN $CLAUDE_DEFAULT_FLAGS "${FILTERED_ARGS[@]}"
+            fi
+        else
+            # Normal fresh start - session hook will check for handoffs
+            log "Starting fresh: $CLAUDE_BIN $CLAUDE_DEFAULT_FLAGS ${FILTERED_ARGS[*]}"
+            $CLAUDE_BIN $CLAUDE_DEFAULT_FLAGS "${FILTERED_ARGS[@]}"
+        fi
+    else
+        # Auto-restart - handoff should exist from pre-compact hook
+
+        # Check for handoff using manifest system
+        HANDOFF_FILE=""
+        HANDOFF_ID=""
+        if type has_active_handoff &>/dev/null && has_active_handoff "$CHANNEL"; then
+            HANDOFF_FILE=$(get_active_handoff_file "$CHANNEL")
+            HANDOFF_ID=$(get_active_handoff_id "$CHANNEL")
+        fi
+
+        if [ -n "$HANDOFF_FILE" ]; then
+            HANDOFF_PROMPT="Continue from handoff (ID: $HANDOFF_ID). The handoff should be auto-loaded by the session hook. Continue the task from where we left off."
+            log "Restarting with handoff: $HANDOFF_ID"
+        else
+            HANDOFF_PROMPT="Continue from handoff. Check memory-keeper for recent context and continue where we left off."
+            log "Restarting (no handoff found for channel: $CHANNEL)"
+        fi
+
+        NEW_SESSION=$(cat /proc/sys/kernel/random/uuid)
+
+        if [ -f "$HOME/.claude/.test-mode" ]; then
+            # Demo mode: scroll old session off gradually while Claude loads
+            TERM_HEIGHT=$(tput lines 2>/dev/null || echo 50)
+            (
+                sleep 3.5  # Let user read the cliffhanger
+                for i in $(seq 1 $TERM_HEIGHT); do
+                    printf '\n'
+                    sleep 0.02
+                done
+            ) &
+            SCROLL_PID=$!
+            log "Forcing new session (test mode): $NEW_SESSION"
+            $CLAUDE_BIN $CLAUDE_DEFAULT_FLAGS --session-id "$NEW_SESSION" "$HANDOFF_PROMPT"
+            kill $SCROLL_PID 2>/dev/null
+        else
+            # Normal mode: clear screen and scrollback, FORCE new session
+            printf '\033[2J\033[3J\033[H'
+            log "Forcing new session: $NEW_SESSION"
+            $CLAUDE_BIN $CLAUDE_DEFAULT_FLAGS --session-id "$NEW_SESSION" "$HANDOFF_PROMPT"
+        fi
+    fi
+    EXIT_CODE=$?
+    log "Claude exited: $EXIT_CODE"
+
+    # Clear session tracking
+    rm -f "$CURRENT_SESSION_FILE"
+
+    # Exit code 130 = SIGINT (Ctrl+C) - user wants to quit, never restart
+    if [ $EXIT_CODE -eq 130 ]; then
+        log "User pressed Ctrl+C - clean exit, no restart"
+        rm -f "$RESTART_FILE" "$RESTART_FILE.dir" "$KILLED_BY_MONITOR"
+        break
+    fi
+
+    # Only restart if MONITOR killed Claude (not user Ctrl+C)
+    if [ -f "$KILLED_BY_MONITOR" ]; then
+        rm -f "$KILLED_BY_MONITOR"
+
+        if [ -f "$RESTART_FILE" ] || [ -f "$RESTART_FILE.dir" ]; then
+            # Get working dir from saved file
+            if [ -f "$RESTART_FILE.dir" ]; then
+                SIGNAL_DIR=$(cat "$RESTART_FILE.dir" 2>/dev/null)
+            else
+                SIGNAL_DIR=$(cat "$RESTART_FILE" 2>/dev/null | cut -d: -f2-)
+            fi
+
+            log "Auto-restart triggered (monitor killed session)"
+            rm -f "$RESTART_FILE" "$RESTART_FILE.dir"
+
+            [ -n "$SIGNAL_DIR" ] && [ -d "$SIGNAL_DIR" ] && WORKING_DIR="$SIGNAL_DIR" && cd "$WORKING_DIR"
+
+            RESTART_COUNT=$((RESTART_COUNT + 1))
+            [ $RESTART_COUNT -ge $MAX_RESTARTS ] && echo "Max restarts reached" && exit 1
+
+            # Extra cleanup before restart to prevent stale signals
+            rm -f "$RESTART_FILE" "$RESTART_FILE.dir" "$KILLED_BY_MONITOR"
+            continue
+        fi
+    fi
+
+    # Clean exit - don't restart
+    rm -f "$RESTART_FILE" "$RESTART_FILE.dir"  # Clean up any stale signal
+
+    # Check for active handoff to notify user
+    if type has_active_handoff &>/dev/null && has_active_handoff "$CHANNEL"; then
+        HANDOFF_FILE=$(get_active_handoff_file "$CHANNEL")
+        HANDOFF_ID=$(get_active_handoff_id "$CHANNEL")
+        echo "Handoff available: $HANDOFF_ID (use 'claude --handoff' to load)"
+    fi
+
+    log "Clean exit"
+    break
+done
+
+log "=== Wrapper finished ==="
+exit $EXIT_CODE
